@@ -231,7 +231,6 @@ async function createLeadInSalesforce(data) {
       Description: data.requirement,
       LeadSource: 'WhatsApp',
       Status: 'Open - Not Contacted',
-      WhatsApp_Number__c: data.whatsappNumber,
       WhatsApp_Message__c: data.requirement,
       WhatsApp_Conversation_ID__c: data.whatsappNumber
     };
@@ -289,33 +288,14 @@ app.get('/', (req, res) => {
 });
 
 // Start the server
-const server = app.listen(PORT, async () => {
+app.listen(PORT, async () => {
   console.log('=================================');
   console.log('🚀 WhatsApp Bot Server Started!');
   console.log(`📡 Port: ${PORT}`);
   console.log('=================================');
   
-  // Connect to Salesforce on startup with retry logic
-  let retries = 3;
-  while (retries > 0 && !sfConnection) {
-    console.log(`\n🔄 Salesforce connection attempt (${4 - retries}/3)...`);
-    const connected = await connectToSalesforce();
-    if (!connected) {
-      retries--;
-      if (retries > 0) {
-        console.log(`⏳ Retrying in 5 seconds...`);
-        await new Promise(resolve => setTimeout(resolve, 5000));
-      }
-    } else {
-      break;
-    }
-  }
-  
-  if (!sfConnection) {
-    console.log('\n⚠️ WARNING: Salesforce connection failed after 3 attempts');
-    console.log('The server is running but lead creation will not work');
-    console.log('Please check your credentials and try restarting the server');
-  }
+  // Connect to Salesforce on startup
+  await connectToSalesforce();
 });
 
 // Handle graceful shutdown
@@ -324,5 +304,6 @@ process.on('SIGTERM', () => {
   if (sfConnection) {
     sfConnection.logout();
   }
+
   process.exit(0);
 });
