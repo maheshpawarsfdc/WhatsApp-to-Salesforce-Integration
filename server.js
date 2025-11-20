@@ -1,4 +1,4 @@
-// WhatsApp to Salesforce Conversational Bot
+// WhatsApp to Salesforce Conversational Bot with Message History
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -19,8 +19,9 @@ const {
   PORT = 3000
 } = process.env;
 
-// In-memory storage for conversation states
+// In-memory storage for conversation states and history
 const conversations = new Map();
+const messageHistory = new Map(); // Store all messages per phone number
 
 // Salesforce connection
 let sfConnection = null;
@@ -44,15 +45,9 @@ async function connectToSalesforce() {
       loginUrl: SALESFORCE_LOGIN_URL
     });
     
-    // Combine password and security token (no space between them)
-    const passwordWithToken = SALESFORCE_PASSWORD + SALESFORCE_SECURITY_TOKEN;
-    
-    console.log('Attempting login with username:', SALESFORCE_USERNAME);
-    console.log('Login URL:', SALESFORCE_LOGIN_URL);
-    
     await conn.login(
       SALESFORCE_USERNAME,
-      passwordWithToken
+      SALESFORCE_PASSWORD + SALESFORCE_SECURITY_TOKEN
     );
     
     sfConnection = conn;
@@ -60,19 +55,21 @@ async function connectToSalesforce() {
     return true;
   } catch (error) {
     console.error('❌ Salesforce connection failed:', error.message);
-    console.error('Error details:', error);
-    
-    // Debug information
-    if (error.message.includes('INVALID_LOGIN')) {
-      console.log('⚠️ Possible causes:');
-      console.log('1. Check if credentials in .env are correct');
-      console.log('2. Verify security token is current (regenerate if needed)');
-      console.log('3. Ensure user account is not locked in Salesforce');
-      console.log('4. Check if the organization is accessible from your IP');
-    }
-    
     return false;
   }
+}
+
+// Store message in history
+function storeMessage(phoneNumber, sender, message, timestamp = new Date()) {
+  if (!messageHistory.has(phoneNumber)) {
+    messageHistory.set(phoneNumber, []);
+  }
+  
+  messageHistory.get(phoneNumber).push({
+    sender: sender, // 'customer' or 'bot' or 'sales'
+    message: message,
+    timestamp: timestamp.toISOString()
+  });
 }
 
 // Webhook verification endpoint (required by Meta)
@@ -112,6 +109,9 @@ app.post('/webhook', async (req, res) => {
         const messageText = message.text?.body?.trim() || '';
 
         console.log(`📱 Message from ${from}: "${messageText}"`);
+
+        // Store customer message
+        storeMessage(from, 'customer', messageText);
 
         // Handle the conversation
         await handleConversation(from, messageText);
@@ -208,6 +208,9 @@ async function handleConversation(userPhone, userMessage) {
 
     // Send reply to user
     await sendWhatsAppMessage(userPhone, reply);
+    
+    // Store bot's reply in history
+    storeMessage(userPhone, 'bot', reply);
 
   } catch (error) {
     console.error('❌ Error in conversation handler:', error);
@@ -231,6 +234,7 @@ async function createLeadInSalesforce(data) {
       Description: data.requirement,
       LeadSource: 'WhatsApp',
       Status: 'Open - Not Contacted',
+      WhatsApp_Number__c: data.whatsappNumber,
       WhatsApp_Message__c: data.requirement,
       WhatsApp_Conversation_ID__c: data.whatsappNumber
     };
@@ -272,12 +276,79 @@ async function sendWhatsAppMessage(to, message) {
   }
 }
 
+// NEW: API endpoint to send message from Salesforce
+app.post('/api/send-message', async (req, res) => {
+  try {
+    const { phoneNumber, message } = req.body;
+
+    // Validate input
+    if (!phoneNumber || !message) {
+      return res.status(400).json({
+        success: false,
+        error: 'Phone number and message are required'
+      });
+    }
+
+    // Clean phone number (remove + if present, keep only digits)
+    const cleanPhone = phoneNumber.replace(/\D/g, '');
+
+    console.log(`📤 Sending message from Salesforce to ${cleanPhone}`);
+
+    // Send WhatsApp message
+    await sendWhatsAppMessage(cleanPhone, message);
+
+    // Store message in history
+    storeMessage(cleanPhone, 'sales', message);
+
+    res.json({
+      success: true,
+      message: 'Message sent successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Error in send-message API:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to send message'
+    });
+  }
+});
+
+// NEW: API endpoint to get conversation history
+app.get('/api/conversation-history/:phoneNumber', async (req, res) => {
+  try {
+    const phoneNumber = req.params.phoneNumber;
+    
+    // Clean phone number
+    const cleanPhone = phoneNumber.replace(/\D/g, '');
+
+    console.log(`📜 Fetching conversation history for ${cleanPhone}`);
+
+    const history = messageHistory.get(cleanPhone) || [];
+
+    res.json({
+      success: true,
+      phoneNumber: cleanPhone,
+      messageCount: history.length,
+      messages: history
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching history:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch history'
+    });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: 'running',
     salesforce: sfConnection ? 'connected' : 'disconnected',
     activeConversations: conversations.size,
+    storedHistories: messageHistory.size,
     timestamp: new Date().toISOString()
   });
 });
@@ -304,6 +375,5 @@ process.on('SIGTERM', () => {
   if (sfConnection) {
     sfConnection.logout();
   }
-
   process.exit(0);
 });
