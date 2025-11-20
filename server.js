@@ -1,4 +1,4 @@
-// WhatsApp to Salesforce Conversational Bot with Message History
+// WhatsApp to Salesforce Conversational Bot - FIXED VERSION
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -19,9 +19,10 @@ const {
   PORT = 3000
 } = process.env;
 
-// In-memory storage for conversation states and history
+// In-memory storage
 const conversations = new Map();
-const messageHistory = new Map(); // Store all messages per phone number
+const messageHistory = new Map();
+const handoffMode = new Map(); // Track if sales team took over
 
 // Salesforce connection
 let sfConnection = null;
@@ -34,7 +35,8 @@ const STAGES = {
   ASKED_EMAIL: 'ASKED_EMAIL',
   ASKED_PHONE: 'ASKED_PHONE',
   ASKED_REQUIREMENT: 'ASKED_REQUIREMENT',
-  COMPLETED: 'COMPLETED'
+  COMPLETED: 'COMPLETED',
+  HANDOFF: 'HANDOFF' // New stage for when sales takes over
 };
 
 // Initialize Salesforce connection
@@ -60,19 +62,37 @@ async function connectToSalesforce() {
 }
 
 // Store message in history
-function storeMessage(phoneNumber, sender, message, timestamp = new Date()) {
-  if (!messageHistory.has(phoneNumber)) {
-    messageHistory.set(phoneNumber, []);
+function storeMessage(phoneNumber, sender, message) {
+  const cleanPhone = phoneNumber.replace(/\D/g, '');
+  
+  if (!messageHistory.has(cleanPhone)) {
+    messageHistory.set(cleanPhone, []);
   }
   
-  messageHistory.get(phoneNumber).push({
-    sender: sender, // 'customer' or 'bot' or 'sales'
+  const timestamp = new Date();
+  messageHistory.get(cleanPhone).push({
+    sender: sender,
     message: message,
     timestamp: timestamp.toISOString()
   });
+  
+  console.log(`💾 Stored message: ${sender} -> ${cleanPhone}`);
 }
 
-// Webhook verification endpoint (required by Meta)
+// Check if conversation is in handoff mode
+function isHandoffMode(phoneNumber) {
+  const cleanPhone = phoneNumber.replace(/\D/g, '');
+  return handoffMode.get(cleanPhone) === true;
+}
+
+// Set handoff mode
+function setHandoffMode(phoneNumber, mode) {
+  const cleanPhone = phoneNumber.replace(/\D/g, '');
+  handoffMode.set(cleanPhone, mode);
+  console.log(`🔄 Handoff mode for ${cleanPhone}: ${mode}`);
+}
+
+// Webhook verification endpoint
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -92,12 +112,10 @@ app.get('/webhook', (req, res) => {
 // Receive WhatsApp messages
 app.post('/webhook', async (req, res) => {
   try {
-    // Acknowledge receipt immediately
     res.sendStatus(200);
 
     const body = req.body;
 
-    // Check if it's a WhatsApp message
     if (body.object === 'whatsapp_business_account') {
       const entry = body.entry?.[0];
       const changes = entry?.changes?.[0];
@@ -105,13 +123,20 @@ app.post('/webhook', async (req, res) => {
 
       if (value?.messages) {
         const message = value.messages[0];
-        const from = message.from; // User's phone number
+        const from = message.from;
         const messageText = message.text?.body?.trim() || '';
 
         console.log(`📱 Message from ${from}: "${messageText}"`);
 
         // Store customer message
         storeMessage(from, 'customer', messageText);
+
+        // Check if in handoff mode
+        if (isHandoffMode(from)) {
+          console.log(`⏸️ In handoff mode - bot will not respond to ${from}`);
+          // Don't respond - sales team will handle
+          return;
+        }
 
         // Handle the conversation
         await handleConversation(from, messageText);
@@ -125,7 +150,6 @@ app.post('/webhook', async (req, res) => {
 // Main conversation handler
 async function handleConversation(userPhone, userMessage) {
   try {
-    // Get or create conversation state
     let conversation = conversations.get(userPhone) || {
       stage: STAGES.INITIAL,
       data: {}
@@ -133,7 +157,6 @@ async function handleConversation(userPhone, userMessage) {
 
     let reply = '';
 
-    // Handle conversation based on current stage
     switch (conversation.stage) {
       case STAGES.INITIAL:
         reply = "👋 Hello! Welcome to our business!\n\nI'd be happy to help you. Let me collect some information.\n\nWhat is your *first name*?";
@@ -153,7 +176,6 @@ async function handleConversation(userPhone, userMessage) {
         break;
 
       case STAGES.ASKED_EMAIL:
-        // Simple email validation
         if (!userMessage.includes('@') || !userMessage.includes('.')) {
           reply = "⚠️ That doesn't look like a valid email address. Please provide a valid email (e.g., name@example.com)";
         } else {
@@ -173,7 +195,6 @@ async function handleConversation(userPhone, userMessage) {
         conversation.data.requirement = userMessage;
         conversation.data.whatsappNumber = userPhone;
         
-        // Create lead in Salesforce
         console.log('💾 Creating lead in Salesforce...');
         const leadId = await createLeadInSalesforce(conversation.data);
         
@@ -181,12 +202,6 @@ async function handleConversation(userPhone, userMessage) {
           reply = `✅ Thank you, ${conversation.data.firstName}!\n\nWe've received your inquiry. Our sales team will contact you shortly on WhatsApp.\n\n📋 Your reference number: ${leadId}`;
           conversation.stage = STAGES.COMPLETED;
           console.log(`✅ Lead created successfully: ${leadId}`);
-          
-          // Clear conversation after 60 seconds
-          setTimeout(() => {
-            conversations.delete(userPhone);
-            console.log(`🗑️ Conversation cleared for ${userPhone}`);
-          }, 60000);
         } else {
           reply = "❌ Sorry, there was an error saving your information. Please try again or contact us directly.";
           console.log('❌ Failed to create lead');
@@ -201,15 +216,15 @@ async function handleConversation(userPhone, userMessage) {
           reply = "Your inquiry has already been submitted. Our team will reach out soon!\n\nIf you have a new inquiry, type 'restart'.";
         }
         break;
+
+      case STAGES.HANDOFF:
+        // In handoff mode - don't respond
+        console.log(`⏸️ In handoff mode - not responding to ${userPhone}`);
+        return;
     }
 
-    // Save conversation state
     conversations.set(userPhone, conversation);
-
-    // Send reply to user
     await sendWhatsAppMessage(userPhone, reply);
-    
-    // Store bot's reply in history
     storeMessage(userPhone, 'bot', reply);
 
   } catch (error) {
@@ -276,12 +291,11 @@ async function sendWhatsAppMessage(to, message) {
   }
 }
 
-// NEW: API endpoint to send message from Salesforce
+// API endpoint to send message from Salesforce
 app.post('/api/send-message', async (req, res) => {
   try {
     const { phoneNumber, message } = req.body;
 
-    // Validate input
     if (!phoneNumber || !message) {
       return res.status(400).json({
         success: false,
@@ -289,9 +303,7 @@ app.post('/api/send-message', async (req, res) => {
       });
     }
 
-    // Clean phone number (remove + if present, keep only digits)
     const cleanPhone = phoneNumber.replace(/\D/g, '');
-
     console.log(`📤 Sending message from Salesforce to ${cleanPhone}`);
 
     // Send WhatsApp message
@@ -299,6 +311,14 @@ app.post('/api/send-message', async (req, res) => {
 
     // Store message in history
     storeMessage(cleanPhone, 'sales', message);
+
+    // IMPORTANT: Set handoff mode - bot will stop responding
+    setHandoffMode(cleanPhone, true);
+
+    // Update conversation stage to HANDOFF
+    let conversation = conversations.get(cleanPhone) || { stage: STAGES.INITIAL, data: {} };
+    conversation.stage = STAGES.HANDOFF;
+    conversations.set(cleanPhone, conversation);
 
     res.json({
       success: true,
@@ -314,17 +334,17 @@ app.post('/api/send-message', async (req, res) => {
   }
 });
 
-// NEW: API endpoint to get conversation history
+// API endpoint to get conversation history
 app.get('/api/conversation-history/:phoneNumber', async (req, res) => {
   try {
-    const phoneNumber = req.params.phoneNumber;
-    
-    // Clean phone number
+    let phoneNumber = req.params.phoneNumber;
     const cleanPhone = phoneNumber.replace(/\D/g, '');
 
     console.log(`📜 Fetching conversation history for ${cleanPhone}`);
 
     const history = messageHistory.get(cleanPhone) || [];
+
+    console.log(`📊 Found ${history.length} messages for ${cleanPhone}`);
 
     res.json({
       success: true,
@@ -342,6 +362,24 @@ app.get('/api/conversation-history/:phoneNumber', async (req, res) => {
   }
 });
 
+// API endpoint to resume bot (if sales wants bot to take over again)
+app.post('/api/resume-bot', async (req, res) => {
+  try {
+    const { phoneNumber } = req.body;
+    const cleanPhone = phoneNumber.replace(/\D/g, '');
+    
+    setHandoffMode(cleanPhone, false);
+    
+    let conversation = conversations.get(cleanPhone) || { stage: STAGES.COMPLETED, data: {} };
+    conversation.stage = STAGES.COMPLETED;
+    conversations.set(cleanPhone, conversation);
+    
+    res.json({ success: true, message: 'Bot resumed' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -349,6 +387,7 @@ app.get('/health', (req, res) => {
     salesforce: sfConnection ? 'connected' : 'disconnected',
     activeConversations: conversations.size,
     storedHistories: messageHistory.size,
+    handoffSessions: handoffMode.size,
     timestamp: new Date().toISOString()
   });
 });
@@ -365,7 +404,6 @@ app.listen(PORT, async () => {
   console.log(`📡 Port: ${PORT}`);
   console.log('=================================');
   
-  // Connect to Salesforce on startup
   await connectToSalesforce();
 });
 
